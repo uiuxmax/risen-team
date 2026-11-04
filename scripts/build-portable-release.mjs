@@ -273,7 +273,14 @@ function extractArchive(archivePath, target, runtimeNodeDir) {
   }
 
   console.log(`  [${new Date().toISOString()}] copying from ${sourceDir} to ${runtimeNodeDir}`);
-  fs.cpSync(sourceDir, runtimeNodeDir, { recursive: true, dereference: true });
+  if (target.startsWith("darwin-")) {
+    // The application needs only Node itself. npm/corepack symlinks in the
+    // official archive can become dangling when the temporary tree is removed.
+    fs.mkdirSync(path.join(runtimeNodeDir, "bin"), { recursive: true });
+    fs.copyFileSync(path.join(sourceDir, "bin", "node"), path.join(runtimeNodeDir, "bin", "node"));
+  } else {
+    fs.cpSync(sourceDir, runtimeNodeDir, { recursive: true, dereference: true });
+  }
   console.log(`  [${new Date().toISOString()}] copy finished, cleaning temp`);
   fs.rmSync(tempExtractDir, { recursive: true, force: true });
   console.log(`  [${new Date().toISOString()}] extraction complete`);
