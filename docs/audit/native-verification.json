@@ -1,5 +1,5 @@
 {
-    "sourceDigest":  "b16aebb611855401712c276572f2c00f667ad5f3bda1d5f741f848263bacfe57",
+    "sourceDigest":  "2ae81f64663c390943578f02bbaa3ea36d0f48b61c41136c543062a651dc6f8f",
     "tests":  "passed",
     "audit":  "passed",
     "codeReview":  "passed",
@@ -29,7 +29,8 @@
                     "Independent native reviewer of branding/provider changes: no actionable blockers.",
                     "Independent backup reviewer of recovery changes: fixed accepted-recovery/in-flight-save race; regression verified.",
                     "Reviewed macOS packaging fix: ship only the Node executable to avoid dangling npm/corepack links; local tests, lint and typecheck passed.",
-                    "Reviewed Swift application entry point: execute AppKit startup in the main actor; macOS compilation and runtime verification remain pending."
+                    "Reviewed Swift application entry point: execute AppKit startup in the main actor; macOS compilation and runtime verification remain pending.",
+                    "Reviewed CI handoff: store build archives in separate private draft releases with repository content permission; no release is published."
                 ],
     "exportVisualReview":  "passed: actual Chrome PNG/SVG and desktop/mobile screenshots",
     "manualBrowserReview":  "Automated real Chrome acceptance passed; screenshots visually reviewed",

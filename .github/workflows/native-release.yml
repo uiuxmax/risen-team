@@ -1,5 +1,8 @@
 name: Reviewed native desktop release
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -71,11 +74,15 @@ jobs:
           test -s "$app/Contents/Resources/menubar.png"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")" = 'app.icns'
           codesign --verify --deep --strict "$app"
-      - name: Upload native test distribution
-        uses: actions/upload-artifact@v4
-        with:
-          name: RisenTeam-native-${{ matrix.target }}
-          path: |
-            dist/RisenTeam-native-${{ matrix.target }}.zip
-            dist/RisenTeam-native-${{ matrix.target }}.zip.sha256
-            dist/native-release/${{ matrix.target }}/RisenTeamSchedule/native-release-manifest.json
+      - name: Save native test distribution as a private draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ci-${{ github.run_id }}-${{ matrix.target }}" \
+            --draft --target "$GITHUB_SHA" \
+            --title "Test build ${{ matrix.target }} (${{ github.run_id }})" \
+            --notes "Private test build; not a public release." \
+            "dist/RisenTeam-native-${{ matrix.target }}.zip" \
+            "dist/RisenTeam-native-${{ matrix.target }}.zip.sha256" \
+            "dist/native-release/${{ matrix.target }}/RisenTeamSchedule/native-release-manifest.json"
