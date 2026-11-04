@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Next.js and other build output
+.next/
+out/
+dist/
+build/
+.turbo/
+.cache/
+
+# Test and coverage output
+coverage/
+playwright-report/
+test-results/
+
+# TypeScript/compiler caches
+*.tsbuildinfo
+
+# Logs and temporary files
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.tmp
+*.temp
+
+# Local environment files (keep only the safe template)
+.env
+.env.local
+.env.*.local
+.env.*
+!.env.example
+
+# Local-first runtime data (SQLite and rotating safety backups)
+data/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+data/backups/*.json
+
+# OS metadata
+.DS_Store
+Thumbs.db

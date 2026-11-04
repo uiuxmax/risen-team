@@ -1,0 +1,1524 @@
+name: Portable Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify runner architecture is x64
+        shell: pwsh
+        run: |
+          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+          Write-Host "PROCESSOR_ARCHITEW6432=$env:PROCESSOR_ARCHITEW6432"
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          if ($arch -ne "AMD64") {
+            Write-Error "Expected AMD64/x64 runner, got $arch"
+            exit 1
+          }
+          if (-not [Environment]::Is64BitOperatingSystem) {
+            Write-Error "OS is not 64-bit"
+            exit 1
+          }
+          Write-Host "Runner architecture verified: x64"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: 'npm'
+
+      - name: Install dependencies safely
+        shell: pwsh
+        run: |
+          npm ci --ignore-scripts
+
+      - name: Initialize the native SQLite addon
+        run: npm rebuild better-sqlite3 --foreground-scripts
+
+      - name: Verify better-sqlite3 works natively
+        shell: pwsh
+        run: |
+          node -e "const Database = require('better-sqlite3'); const db = new Database(':memory:'); console.log(db.prepare('select 1 as value').get()); db.close(); console.log('better-sqlite3 OK')"
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Vitest
+        run: npx vitest run
+
+      - name: Build
+        run: npm run build
+
+      - name: Prepare portable
+        run: npm run prepare:portable
+
+      - name: Verify portable layout (no EPERM, no symlink, assets)
+        shell: pwsh
+        run: |
+          $portable = "dist/portable/RisenTeamSchedule"
+          if (-not (Test-Path "$portable/server.js")) { throw "server.js missing" }
+          if (-not (Test-Path "$portable/.next/static")) { throw ".next/static missing" }
+          if (-not (Test-Path "$portable/public")) { throw "public missing" }
+          if (-not (Test-Path "$portable/start.bat")) { throw "start.bat missing" }
+          if (-not (Test-Path "$portable/start.command")) { throw "start.command missing" }
+          if (-not (Test-Path "$portable/node_modules/better-sqlite3")) { throw "better-sqlite3 missing" }
+
+          # Verify better-sqlite3 is NOT a symlink/junction
+          $bsPath = "$portable/node_modules/better-sqlite3"
+          $item = Get-Item -LiteralPath $bsPath -Force
+          if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "better-sqlite3 is a reparse point (symlink/junction) - should be real directory"
+          }
+          Write-Host "better-sqlite3 is real directory, not symlink"
+
+          # Verify no symlink in portable that points outside
+          $symlinks = Get-ChildItem -Path $portable -Recurse -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }
+          if ($symlinks) {
+            $symlinks | ForEach-Object { Write-Host "Found reparse point: $($_.FullName) -> $($_.LinkTarget)" }
+            throw "Portable bundle contains reparse points/symlinks"
+          }
+          Write-Host "No symlinks found in portable bundle - EPERM fix verified"
+
+          # Verify no user data
+          $forbidden = Get-ChildItem -Path $portable -Recurse -Force | Where-Object { $_.Name -like "*risen-team.db*" -or $_.Name -like ".env*" }
+          if ($forbidden) {
+            $forbidden | ForEach-Object { Write-Host "Forbidden: $($_.FullName)" }
+            throw "Forbidden user data found"
+          }
+          Write-Host "Portable layout verified"
+
+      - name: Pre-download Node runtime (win-x64)
+        shell: pwsh
+        run: |
+          $lock = Get-Content scripts/node-runtime-lock.json | ConvertFrom-Json
+          $info = $lock.targets.'win-x64'
+          $url = $info.url
+          $filename = $info.filename
+          $sha = $info.sha256
+          $cacheDir = "dist/cache/node-runtime"
+          New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+          $dest = Join-Path $cacheDir $filename
+          if (Test-Path $dest) {
+            $existing = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
+            if ($existing -eq $sha.ToLower()) {
+              Write-Host "Cached archive OK: $dest $existing"
+            } else {
+              Write-Host "Checksum mismatch cached $existing vs $sha, re-downloading"
+              Remove-Item $dest -Force
+            }
+          }
+          if (-not (Test-Path $dest)) {
+            Write-Host "Downloading $url to $dest"
+            # Use Invoke-WebRequest with retry
+            $attempt = 0
+            $maxAttempts = 3
+            while ($attempt -lt $maxAttempts) {
+              $attempt++
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+                break
+              } catch {
+                Write-Host "Attempt $attempt failed: $($_.Exception.Message)"
+                if ($attempt -ge $maxAttempts) { throw }
+                Start-Sleep -Seconds ($attempt * 2)
+              }
+            }
+            $actual = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
+            Write-Host "Downloaded SHA: $actual expected $sha"
+            if ($actual -ne $sha.ToLower()) { throw "Checksum mismatch after download" }
+          }
+          Write-Host "Node archive ready: $dest"
+
+      - name: Release portable (win-x64)
+        shell: pwsh
+        run: |
+          Write-Host "=== Cache dir listing ==="
+          if (Test-Path dist/cache/node-runtime) { Get-ChildItem dist/cache/node-runtime | Format-Table Name, Length } else { Write-Host "Cache dir not found" }
+          Write-Host "=== Starting release:portable ==="
+          # Use Out-File to avoid Tee-Object potential hang, then cat file
+          npm run release:portable -- --target=win-x64 2>&1 | Out-File -FilePath dist/release-win-x64.log -Encoding utf8
+          $exitCode = $LASTEXITCODE
+          Write-Host "=== Release log tail ==="
+          if (Test-Path dist/release-win-x64.log) { Get-Content dist/release-win-x64.log -Tail 100 }
+          if ($exitCode -ne 0) { throw "release:portable failed with exit $exitCode" }
+          Write-Host "=== Release completed successfully ==="
+
+      - name: Report release failure (Windows)
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "=== Release failure log ==="
+          if (Test-Path dist/release-win-x64.log) { Get-Content dist/release-win-x64.log -Tail 300 }
+          Write-Host "=== End log ==="
+
+      - name: Upload release log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-log-windows-x64
+          path: dist/release-win-x64.log
+          if-no-files-found: warn
+
+      - name: Post failure comment to PR (Windows) via github-script
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'dist/release-win-x64.log';
+            let logContent = 'Log file not found';
+            try {
+              logContent = fs.readFileSync(path, 'utf8');
+              if (logContent.length > 40000) {
+                logContent = logContent.slice(-40000);
+              }
+            } catch (e) {
+              logContent = `Failed to read log: ${e.message}`;
+            }
+            const body = `**Windows x64 release failed** in run ${{ github.run_id }} (${{ github.run_attempt }})\n\n\`\`\`\n${logContent}\n\`\`\`\n\nBranch: arena/portable-release`;
+            // Try to find PR for this branch, fallback to 13
+            let prNumber = 13;
+            try {
+              const prs = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner}:arena/portable-release`,
+                state: 'open'
+              });
+              if (prs.data.length > 0) {
+                prNumber = prs.data[0].number;
+              }
+            } catch (err) {
+              console.log(`Failed to list PRs: ${err.message}, using fallback ${prNumber}`);
+            }
+            console.log(`Posting comment to PR #${prNumber}, log length ${logContent.length}`);
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body
+              });
+              console.log('Comment posted successfully');
+            } catch (err) {
+              console.log(`Failed to post comment: ${err.message}`);
+              console.log(err.stack);
+            }
+
+      - name: Verify release layout and bundled Node
+        shell: pwsh
+        run: |
+          $release = "dist/releases/win-x64/RisenTeamSchedule"
+          $zip = "dist/RisenTeamSchedule-Windows-x64.zip"
+          if (-not (Test-Path "$release/runtime/node/node.exe")) { throw "Bundled node.exe missing" }
+          if (-not (Test-Path $zip)) { throw "ZIP missing: $zip" }
+          Write-Host "Bundled Node exists: $release/runtime/node/node.exe"
+          & "$release/runtime/node/node.exe" --version
+          $ver = & "$release/runtime/node/node.exe" --version
+          if ($ver.Trim() -ne "v22.23.2") { throw "Version mismatch: expected v22.23.2, got $ver" }
+          $arch = & "$release/runtime/node/node.exe" -p "process.arch"
+          Write-Host "Bundled Node arch: $arch"
+          if ($arch.Trim() -ne "x64") { throw "Arch mismatch: expected x64, got $arch" }
+
+          # Verify release-manifest.json
+          if (-not (Test-Path "$release/release-manifest.json")) { throw "release-manifest.json missing" }
+          $manifest = Get-Content "$release/release-manifest.json" | ConvertFrom-Json
+          if ($manifest.bundledNode -ne $true) { throw "bundledNode should be true" }
+          if ($manifest.releaseTarget -ne "win-x64") { throw "target mismatch" }
+          if ($manifest.nodeVersion -ne "22.23.2") { throw "nodeVersion mismatch" }
+          Write-Host "Release manifest verified"
+
+          # Verify README.txt
+          if (-not (Test-Path "$release/README.txt")) { throw "README.txt missing" }
+          $readme = Get-Content "$release/README.txt" -Raw
+          if (-not $readme.Contains("start.bat")) { throw "README should mention start.bat" }
+          if (-not $readme.Contains("%LOCALAPPDATA%")) { throw "README should mention LOCALAPPDATA" }
+
+      - name: Verify v1 release contract
+        run: |
+          node -e 'const fs = require("node:fs"); const root = "dist/releases/win-x64/RisenTeamSchedule/"; const m = JSON.parse(fs.readFileSync(root + "release-manifest.json", "utf8")); const b = JSON.parse(fs.readFileSync(root + "manifest.json", "utf8")); if (m.app !== "risen-team-schedule-builder-v1" || m.port !== 3178 || m.hostname !== "127.0.0.1" || !m.loopbackOnly || m.userData.windows !== "%LOCALAPPDATA%\\RisenTeamSchedule-v1.0" || m.userData.macos !== "~/Library/Application Support/RisenTeamSchedule-v1.0" || m.userData.packaged !== false || b.runtime.minimumNodeMajor !== 22) throw new Error("v1 release contract mismatch"); console.log("v1 release contract verified");'
+
+      - name: Test path with spaces
+        shell: pwsh
+        run: |
+          $source = "dist/releases/win-x64/RisenTeamSchedule"
+          $destRoot = "$env:TEMP\Risen Team Portable Test"
+          $dest = "$destRoot\RisenTeamSchedule"
+          if (Test-Path $destRoot) { Remove-Item $destRoot -Recurse -Force }
+          New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
+          Write-Host "Copying to path with spaces: $dest"
+          Copy-Item -Path $source -Destination $dest -Recurse -Force
+          if (-not (Test-Path "$dest/start.bat")) { throw "start.bat missing in spaced path" }
+          if (-not (Test-Path "$dest/runtime/node/node.exe")) { throw "bundled node missing in spaced path" }
+          Write-Host "Path with spaces copy verified"
+
+      - name: Smoke test - real start.bat with bundled Node
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ghWorkspace = $env:GITHUB_WORKSPACE
+          if (-not $ghWorkspace) { $ghWorkspace = (Get-Location).Path }
+          Write-Host "GITHUB_WORKSPACE: $ghWorkspace"
+          # Create smoke log immediately, before anything that could fail
+          $smokeLog = Join-Path $ghWorkspace "dist/smoke-win-x64.log"
+          $smokeFailureLog = Join-Path $ghWorkspace "dist/smoke-failure.txt"
+          $launcherOutLog = Join-Path $ghWorkspace "dist/launcher-output-win.txt"
+          $launcherOut2Log = Join-Path $ghWorkspace "dist/launcher-output2-win.txt"
+          $serverLastLog = Join-Path $ghWorkspace "dist/server-last.log"
+          $releaseLogPath = Join-Path $ghWorkspace "dist/release-win-x64.log"
+          New-Item -ItemType Directory -Path (Split-Path $smokeLog) -Force | Out-Null
+          if (Test-Path $smokeLog) { Remove-Item $smokeLog -Force }
+          if (Test-Path $smokeFailureLog) { Remove-Item $smokeFailureLog -Force }
+          if (Test-Path $launcherOutLog) { Remove-Item $launcherOutLog -Force }
+          if (Test-Path $launcherOut2Log) { Remove-Item $launcherOut2Log -Force }
+          if (Test-Path $serverLastLog) { Remove-Item $serverLastLog -Force }
+          Set-Content -Path $smokeLog -Value "=== Smoke test started $(Get-Date) ===" -Force
+          function Write-Log($msg) {
+            Write-Host $msg
+            try { Add-Content -Path $smokeLog -Value $msg -ErrorAction SilentlyContinue } catch { Write-Host "Write-Log failed: $($_.Exception.Message)" }
+          }
+          Write-Log "Workspace: $ghWorkspace"
+          Write-Log "GITHUB_WORKSPACE env: $env:GITHUB_WORKSPACE"
+          Write-Log "Current location: $((Get-Location).Path)"
+          try {
+            $releasePathTest = Resolve-Path "dist/releases/win-x64/RisenTeamSchedule" -ErrorAction Stop
+            $release = $releasePathTest.Path
+            Write-Log "Release absolute path: $release"
+          } catch {
+            Write-Log "Failed to resolve release path: $($_.Exception.Message)"
+            Write-Host "Failed to resolve release path: $($_.Exception.Message)"
+            throw
+          }
+          $testDbDir = "$env:TEMP\RisenTest-$([Guid]::NewGuid().ToString())"
+          New-Item -ItemType Directory -Path $testDbDir -Force | Out-Null
+          $testDbPath = Join-Path $testDbDir "risen-team.db"
+          $env:RISEN_DB_PATH = $testDbPath
+          Write-Host "Using temporary DB: $testDbPath"
+          $outputLog = Join-Path $testDbDir "launcher-output.txt"
+          $secondOutputLog = Join-Path $testDbDir "launcher-output2.txt"
+          Write-Log "Test DB: $testDbPath"
+          Write-Log "SmokeLog: $smokeLog"
+          Write-Log "OutputLog: $outputLog"
+          Write-Log "LauncherOutLog: $launcherOutLog"
+
+          try {
+            # Ensure no previous server on 3178
+            try {
+              $health = Invoke-WebRequest -Uri "http://127.0.0.1:3178/api/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+              if ($health) {
+                Write-Host "Port 3178 in use, freeing..."
+                $conns = Get-NetTCPConnection -LocalPort 3178 -ErrorAction SilentlyContinue
+                foreach ($c in $conns) { try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} }
+                Start-Sleep -Seconds 2
+              }
+            } catch {}
+
+            Write-Host "Launching start.bat -NoBrowser from $release"
+            Write-Log "Launching start.bat, outputLog=$outputLog"
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "cmd.exe"
+            $psi.Arguments = "/c start.bat -NoBrowser > `"$outputLog`" 2>&1"
+            $psi.WorkingDirectory = $release
+            $psi.UseShellExecute = $false
+            $psi.Environment["RISEN_DB_PATH"] = $testDbPath
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $proc.WaitForExit(30000) | Out-Null
+            Write-Log "Launcher process exited, checking output"
+
+            $launcherOutput = ""
+            if (Test-Path $outputLog) { $launcherOutput = Get-Content $outputLog -Raw } else { Write-Log "outputLog not found after launch!" }
+            Write-Host "Launcher output:`n$launcherOutput"
+            Write-Log "Launcher output:`n$launcherOutput"
+
+            if (-not $launcherOutput.Contains("Node (bundled)")) {
+              throw "Bundled Node not selected - should contain 'Node (bundled)'. Output was: $launcherOutput"
+            }
+            Write-Host "Bundled Node proof OK"
+            Write-Log "Bundled Node proof OK"
+
+            $maxWait = 45
+            $deadline = (Get-Date).AddSeconds($maxWait)
+            $healthy = $false
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:3178/api/health" -UseBasicParsing -TimeoutSec 3
+                if ($resp.StatusCode -eq 200) {
+                  $body = $resp.Content | ConvertFrom-Json
+                  if ($body.app -eq "risen-team-schedule-builder-v1") {
+                    Write-Host "Health OK: $($resp.Content)"
+                    Write-Log "Health OK: $($resp.Content)"
+                    $healthy = $true
+                    break
+                  }
+                }
+              } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $healthy) { throw "Server not healthy within $maxWait seconds. Last launcher output: $launcherOutput" }
+
+            $netstat = netstat -ano | Select-String "3178"
+            Write-Host "netstat 3178:`n$netstat"
+            Write-Log "netstat 3178:`n$netstat"
+            if ($netstat | Select-String "0.0.0.0:3178") { throw "Binds to 0.0.0.0, should be 127.0.0.1 only" }
+            if (-not ($netstat | Select-String "127.0.0.1:3178")) { throw "Not bound to 127.0.0.1:3178" }
+            Write-Host "Bind verified 127.0.0.1:3178"
+            Write-Log "Bind verified 127.0.0.1:3178"
+
+            $scheduleResp = Invoke-WebRequest -Uri "http://127.0.0.1:3178/schedule" -UseBasicParsing -TimeoutSec 5
+            if ($scheduleResp.StatusCode -ne 200) { throw "/schedule $($scheduleResp.StatusCode)" }
+            Write-Host "/schedule 200 OK"
+            Write-Log "/schedule 200 OK"
+
+            $workspaceResp = Invoke-WebRequest -Uri "http://127.0.0.1:3178/api/workspace" -UseBasicParsing -TimeoutSec 5
+            if ($workspaceResp.StatusCode -ne 200) { throw "/api/workspace $($workspaceResp.StatusCode)" }
+            Write-Host "/api/workspace 200 OK"
+            Write-Log "/api/workspace 200 OK"
+
+            Start-Sleep -Seconds 2
+            if (-not (Test-Path $testDbPath)) { throw "DB not created at $testDbPath" }
+            Write-Host "DB created: $testDbPath"
+            Write-Log "DB created: $testDbPath"
+
+            # Fixed SQLite check: use array of lines to avoid PowerShell here-string parser issues (no @\" terminator whitespace bug)
+            $checkLines = @(
+              'const path = require(''path'');',
+              'const releaseDir = process.env.RISEN_RELEASE_DIR;',
+              'const Database = require(path.join(releaseDir, ''node_modules'', ''better-sqlite3''));',
+              'const db = new Database(process.env.RISEN_DB_PATH);',
+              'const row = db.prepare(''PRAGMA user_version'').get();',
+              'console.log(''user_version='' + row.user_version);',
+              'if (row.user_version !== 1) throw new Error(''user_version expected 1, got '' + row.user_version);',
+              'db.close();',
+              'console.log(''SQLite check OK'');'
+            )
+            $checkScript = $checkLines -join "`n"
+            $checkScriptPath = Join-Path $release "check-user-version.js"
+            Set-Content -Path $checkScriptPath -Value $checkScript
+            $env:RISEN_RELEASE_DIR = $release
+            $env:RISEN_DB_PATH = $testDbPath
+            $nodeExe = Join-Path $release "runtime/node/node.exe"
+            Write-Host "Running SQLite check with $nodeExe $checkScriptPath"
+            Write-Log "Running SQLite check"
+            $uv = & $nodeExe $checkScriptPath 2>&1
+            Write-Host "SQLite check output: $uv"
+            Write-Log "SQLite check output: $uv"
+            if (-not $uv.Contains("user_version=1")) { throw "user_version check failed: $uv" }
+            Remove-Item $checkScriptPath -Force -ErrorAction SilentlyContinue
+
+            $wsBody = $workspaceResp.Content | ConvertFrom-Json
+            Write-Host "Workspace keys: $($wsBody.PSObject.Properties.Name -join ', ')"
+            Write-Log "Workspace keys: $($wsBody.PSObject.Properties.Name -join ', ')"
+
+            Write-Host "Testing repeated start..."
+            Write-Log "Testing repeated start..."
+            $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+            $psi2.FileName = "cmd.exe"
+            $psi2.Arguments = "/c start.bat -NoBrowser > `"$secondOutputLog`" 2>&1"
+            $psi2.WorkingDirectory = $release
+            $psi2.UseShellExecute = $false
+            $psi2.Environment["RISEN_DB_PATH"] = $testDbPath
+            $proc2 = [System.Diagnostics.Process]::Start($psi2)
+            $proc2.WaitForExit(20000) | Out-Null
+            $secondOutput = ""
+            if (Test-Path $secondOutputLog) { $secondOutput = Get-Content $secondOutputLog -Raw } else { Write-Log "secondOutputLog not found" }
+            Write-Host "Second launch output:`n$secondOutput"
+            Write-Log "Second launch output:`n$secondOutput"
+            if (-not $secondOutput.Contains("Already running")) { throw "Repeated start should report Already running. Got: $secondOutput" }
+            Write-Host "Repeated start verified"
+            Write-Log "Repeated start verified"
+
+            Write-Host "Stopping test server..."
+            if ($launcherOutput -match "Server process PID : (\d+)") {
+              $serverPid = $Matches[1]
+              Write-Host "Stopping PID $serverPid"
+              try { Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue } catch {}
+            } else {
+              $connections = Get-NetTCPConnection -LocalPort 3178 -ErrorAction SilentlyContinue
+              foreach ($conn in $connections) {
+                try {
+                  $p = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+                  if ($p.ProcessName -like "*node*") { Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue }
+                } catch {}
+              }
+            }
+            Start-Sleep -Seconds 3
+            try {
+              Invoke-WebRequest -Uri "http://127.0.0.1:3178/api/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop | Out-Null
+              throw "Server still running after stop"
+            } catch {
+              Write-Host "Server stopped, port freed"
+            }
+
+            Write-Host "Windows smoke test SUCCESS"
+          } catch {
+            $errMsg = $_.Exception.Message
+            $stack = $_.ScriptStackTrace
+            Write-Host "Smoke test FAILED: $errMsg"
+            Write-Host $stack
+            Write-Log "FAILED: $errMsg"
+            Write-Log $stack
+            try {
+              Set-Content -Path $smokeFailureLog -Value "FAILED: $errMsg`n$stack" -Force
+              if (Test-Path $outputLog) {
+                Add-Content -Path $smokeFailureLog -Value "`n=== Launcher output ===`n$(Get-Content $outputLog -Raw)" -ErrorAction SilentlyContinue
+              }
+              # List dist files for debugging
+              Write-Host "=== dist dir listing (ghWorkspace) ==="
+              Get-ChildItem (Join-Path $ghWorkspace "dist") -File | Format-Table Name, Length
+              Write-Host "=== ghWorkspace dist contents ==="
+              Write-Host "smokeFailureLog exists: $(Test-Path $smokeFailureLog)"
+              if (Test-Path $smokeFailureLog) { Write-Host "smokeFailureLog size: $((Get-Item $smokeFailureLog).Length)" }
+            } catch {
+              Write-Host "Catch handling failed: $($_.Exception.Message)"
+            }
+            throw
+          } finally {
+            Write-Log "=== Smoke test finished ==="
+            Write-Host "=== dist after smoke (ghWorkspace) ==="
+            try { Get-ChildItem (Join-Path $ghWorkspace "dist") -File | Format-Table Name, Length } catch { Write-Host "Failed to list dist: $($_.Exception.Message)" }
+            Write-Host "Preserving temp dir $testDbDir for failure analysis"
+            try {
+              if (Test-Path $outputLog) {
+                Copy-Item $outputLog $launcherOutLog -Force
+                Write-Host "Launcher output copied to $launcherOutLog, size $((Get-Item $outputLog).Length)"
+              } else {
+                Write-Host "outputLog not found: $outputLog"
+                Set-Content -Path $launcherOutLog -Value "outputLog not found at $outputLog" -Force
+              }
+              if (Test-Path $secondOutputLog) {
+                Copy-Item $secondOutputLog $launcherOut2Log -Force
+                Write-Host "Second output copied to $launcherOut2Log"
+              } else {
+                Write-Host "secondOutputLog not found: $secondOutputLog"
+                Set-Content -Path $launcherOut2Log -Value "secondOutputLog not found at $secondOutputLog" -Force
+              }
+              $localLogDir = Join-Path $env:LOCALAPPDATA "RisenTeamSchedule-v1.0/logs"
+              if (Test-Path $localLogDir) {
+                Get-ChildItem $localLogDir -Filter "server-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | ForEach-Object {
+                  Copy-Item $_.FullName $serverLastLog -Force -ErrorAction SilentlyContinue
+                  Write-Host "Server log copied from $($_.FullName) to $serverLastLog"
+                }
+              } else {
+                Write-Host "Local log dir not found: $localLogDir"
+                Set-Content -Path $serverLastLog -Value "Local log dir not found: $localLogDir" -Force -ErrorAction SilentlyContinue
+              }
+              # List temp dir
+              if (Test-Path $testDbDir) {
+                Write-Host "=== Temp dir $testDbDir listing ==="
+                Get-ChildItem $testDbDir -File -ErrorAction SilentlyContinue | Format-Table Name, Length
+              }
+              Write-Host "=== Final dist files (ghWorkspace) ==="
+              Get-ChildItem (Join-Path $ghWorkspace "dist") -File | Format-Table Name, Length
+            } catch {
+              Write-Host "Finally copy failed: $($_.Exception.Message)"
+              Write-Host $_.ScriptStackTrace
+              try { Add-Content -Path $smokeLog -Value "Finally failed: $($_.Exception.Message)" -ErrorAction SilentlyContinue } catch {}
+            }
+          }
+
+      - name: Report smoke failure (Windows)
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "=== Smoke log ==="
+          if (Test-Path dist/smoke-win-x64.log) { Get-Content dist/smoke-win-x64.log -Tail 800 }
+          else { Write-Host "dist/smoke-win-x64.log not found" }
+          Write-Host "=== Launcher output ==="
+          if (Test-Path dist/launcher-output-win.txt) { Get-Content dist/launcher-output-win.txt -Tail 200 }
+          Write-Host "=== Release log ==="
+          if (Test-Path dist/release-win-x64.log) { Get-Content dist/release-win-x64.log -Tail 200 }
+          $logDir = Join-Path $env:LOCALAPPDATA "RisenTeamSchedule-v1.0/logs"
+          if (Test-Path $logDir) {
+            Get-ChildItem $logDir -Filter "server-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
+              Write-Host "=== $($_.FullName) ==="
+              Get-Content $_.FullName -Tail 300
+            }
+          } else {
+            Write-Host "Log dir not found: $logDir"
+            # Check temp logs
+            $tempLogs = Get-ChildItem $env:TEMP -Directory -Filter "RisenTest-*" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($tempLogs) {
+              $tempLogDir = Join-Path $tempLogs.FullName "logs"
+              if (Test-Path $tempLogDir) {
+                Get-ChildItem $tempLogDir -Filter "server-*.log" | ForEach-Object {
+                  Write-Host "=== $($_.FullName) ==="
+                  Get-Content $_.FullName -Tail 300
+                }
+              }
+            }
+          }
+
+      - name: Upload smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-windows-x64
+          path: |
+            dist/smoke-win-x64.log
+            dist/smoke-failure.txt
+            dist/release-win-x64.log
+            dist/launcher-output-win.txt
+            dist/launcher-output2-win.txt
+            dist/server-last.log
+            dist/zip-extract-win.log
+            dist/zip-launcher-output-win.txt
+            dist/zip-server-last.log
+            ${{ env.LOCALAPPDATA }}\RisenTeamSchedule-v1.0\logs\
+          if-no-files-found: warn
+
+      - name: Verify ZIP extraction and run extracted release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ghWorkspace = $env:GITHUB_WORKSPACE
+          if (-not $ghWorkspace) { $ghWorkspace = (Get-Location).Path }
+          $zipLog = Join-Path $ghWorkspace "dist/zip-extract-win.log"
+          New-Item -ItemType Directory -Path (Split-Path $zipLog) -Force | Out-Null
+          Set-Content -Path $zipLog -Value "=== ZIP extraction test started $(Get-Date) ===" -Force
+          function Write-ZipLog($msg) { Write-Host $msg; try { Add-Content -Path $zipLog -Value $msg -ErrorAction SilentlyContinue } catch {} }
+
+          $zip = "dist/RisenTeamSchedule-Windows-x64.zip"
+          $extractRoot = "$env:TEMP\RisenZipTest"
+          Write-ZipLog "ZIP: $zip"
+          Write-ZipLog "ExtractRoot: $extractRoot"
+          if (Test-Path $extractRoot) { Remove-Item $extractRoot -Recurse -Force }
+          New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+          Write-ZipLog "Expanding archive..."
+          Expand-Archive -Path $zip -DestinationPath $extractRoot -Force
+          $extracted = "$extractRoot\RisenTeamSchedule"
+          Write-ZipLog "Extracted path: $extracted"
+          if (-not (Test-Path "$extracted/server.js")) { throw "Extracted server.js missing" }
+          if (-not (Test-Path "$extracted/runtime/node/node.exe")) { throw "Extracted bundled node missing" }
+          Write-Host "ZIP extraction verified"
+          Write-ZipLog "ZIP extraction verified"
+
+          # Ensure port 3178 free before test
+          try {
+            $health = Invoke-WebRequest -Uri "http://127.0.0.1:3178/api/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+            if ($health) {
+              Write-ZipLog "Port 3178 in use before ZIP test, freeing..."
+              $conns = Get-NetTCPConnection -LocalPort 3178 -ErrorAction SilentlyContinue
+              foreach ($c in $conns) { try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue; Write-ZipLog "Killed PID $($c.OwningProcess)" } catch {} }
+              Start-Sleep -Seconds 3
+            }
+          } catch {}
+
+          # Run extracted release again with temp DB
+          $testDbDir = Join-Path $env:TEMP "RisenZipTestDB-$([Guid]::NewGuid().ToString())"
+          New-Item -ItemType Directory -Path $testDbDir -Force | Out-Null
+          $testDbPath = Join-Path $testDbDir "risen-team.db"
+          $env:RISEN_DB_PATH = $testDbPath
+          Write-ZipLog "Test DB: $testDbPath"
+          Write-ZipLog "Test DB dir: $testDbDir"
+
+          $outputLog = Join-Path $testDbDir "launcher-out.txt"
+          Write-ZipLog "OutputLog: $outputLog"
+          Write-ZipLog "Extracted working dir: $extracted"
+          # Robust launch: use WorkingDirectory and capture via file, but also log attempt
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "cmd.exe"
+          # Avoid full path quoting bug: use working dir, simple start.bat
+          $psi.Arguments = "/c start.bat -NoBrowser > `"$outputLog`" 2>&1"
+          $psi.WorkingDirectory = $extracted
+          $psi.UseShellExecute = $false
+          $psi.Environment["RISEN_DB_PATH"] = $testDbPath
+          Write-ZipLog "Launching extracted start.bat from $extracted (working dir)"
+          Write-ZipLog "Command: cmd.exe $($psi.Arguments) with WorkingDirectory=$extracted"
+          try {
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            if (-not $proc.WaitForExit(15000)) {
+              Write-ZipLog "Launcher process did NOT exit within 15s, killing"
+              try { $proc.Kill() } catch {}
+            }
+          } catch {
+            Write-ZipLog "Failed to start process: $($_.Exception.Message)"
+            throw
+          }
+          $exitCode = if ($proc.HasExited) { $proc.ExitCode } else { -1 }
+          Write-ZipLog "Launcher process exit code: $exitCode, HasExited: $($proc.HasExited)"
+          Write-ZipLog "Launcher exited, waiting 3s"
+          Start-Sleep -Seconds 3
+          # If outputLog still missing, try alternative launch capturing stdout directly (no shell redirection)
+          if (-not (Test-Path $outputLog)) {
+            Write-ZipLog "outputLog missing after first attempt, trying direct stdout capture"
+            $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+            $psi2.FileName = "cmd.exe"
+            $psi2.Arguments = "/c start.bat -NoBrowser"
+            $psi2.WorkingDirectory = $extracted
+            $psi2.UseShellExecute = $false
+            $psi2.RedirectStandardOutput = $true
+            $psi2.RedirectStandardError = $true
+            $psi2.Environment["RISEN_DB_PATH"] = $testDbPath
+            try {
+              $proc2 = [System.Diagnostics.Process]::Start($psi2)
+              $stdOut = $proc2.StandardOutput.ReadToEnd()
+              $stdErr = $proc2.StandardError.ReadToEnd()
+              $proc2.WaitForExit(15000) | Out-Null
+              $combined = $stdOut + "`n" + $stdErr
+              Write-ZipLog "Direct capture output:`n$combined"
+              Set-Content -Path $outputLog -Value $combined -Force
+              Write-ZipLog "Wrote direct capture to $outputLog, exit $($proc2.ExitCode)"
+            } catch {
+              Write-ZipLog "Direct capture failed: $($_.Exception.Message)"
+            }
+          }
+          # List temp dir for debugging
+          try {
+            $files = Get-ChildItem $testDbDir -File -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" }
+            Write-ZipLog "Temp dir $testDbDir files: $($files -join ', ')"
+          } catch {}
+          $launcherContent = ""
+          if (Test-Path $outputLog) {
+            $launcherContent = Get-Content $outputLog -Raw
+            Write-Host "Launcher output:`n$launcherContent"
+            Write-ZipLog "Launcher output:`n$launcherContent"
+          } else {
+            Write-ZipLog "outputLog NOT FOUND: $outputLog"
+            # Try to find any txt in temp dir
+            try {
+              $allFiles = Get-ChildItem $testDbDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+              Write-ZipLog "All files in ${testDbDir}: $($allFiles -join ', ')"
+            } catch {}
+          }
+
+          $maxWait = 30
+          $deadline = (Get-Date).AddSeconds($maxWait)
+          $healthy = $false
+          while ((Get-Date) -lt $deadline) {
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:3178/api/health" -UseBasicParsing -TimeoutSec 3
+              if ($resp.StatusCode -eq 200) { $healthy = $true; Write-ZipLog "Health OK: $($resp.Content)"; break }
+            } catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $healthy) {
+            Write-ZipLog "Extracted release did NOT become healthy within $maxWait seconds"
+            # Copy logs for failure analysis
+            try {
+              Copy-Item $outputLog (Join-Path $ghWorkspace "dist/zip-launcher-output-win.txt") -Force -ErrorAction SilentlyContinue
+              Copy-Item $zipLog (Join-Path $ghWorkspace "dist/zip-extract-win.log") -Force -ErrorAction SilentlyContinue
+              $localLogDir = Join-Path $env:LOCALAPPDATA "RisenTeamSchedule-v1.0/logs"
+              if (Test-Path $localLogDir) {
+                Get-ChildItem $localLogDir -Filter "server-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | ForEach-Object {
+                  Copy-Item $_.FullName (Join-Path $ghWorkspace "dist/zip-server-last.log") -Force -ErrorAction SilentlyContinue
+                  Write-ZipLog "Server log copied from $($_.FullName)"
+                }
+              }
+              $tempLogDir = Join-Path $testDbDir "logs"
+              if (Test-Path $tempLogDir) {
+                Get-ChildItem $tempLogDir -Filter "server-*.log" | ForEach-Object {
+                  Write-ZipLog "=== Temp server log $($_.FullName) ==="
+                  Get-Content $_.FullName -Tail 100 | ForEach-Object { Write-ZipLog $_ }
+                }
+              }
+            } catch { Write-Host "Failed to copy failure logs: $($_.Exception.Message)" }
+            throw "Extracted release did not become healthy. Launcher output: $launcherContent"
+          }
+          Write-Host "Extracted release runs OK"
+          Write-ZipLog "Extracted release runs OK"
+
+          # Stop
+          try {
+            $logContent = Get-Content $outputLog -Raw
+            if ($logContent -match "Server process PID : (\d+)") {
+              $pidToKill = $Matches[1]
+              Write-ZipLog "Stopping PID $pidToKill"
+              Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue
+            } else {
+              Write-ZipLog "No PID found in launcher output, trying netstat"
+              $conns = Get-NetTCPConnection -LocalPort 3178 -ErrorAction SilentlyContinue
+              foreach ($c in $conns) { try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} }
+            }
+          } catch { Write-ZipLog "Stop failed: $($_.Exception.Message)" }
+          Start-Sleep -Seconds 3
+          Write-ZipLog "Cleaning up"
+          Remove-Item $testDbDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Write-ZipLog "ZIP extraction test SUCCESS"
+
+      - name: Generate SHA-256 and verify
+        shell: pwsh
+        run: |
+          $zip = "dist/RisenTeamSchedule-Windows-x64.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "ZIP SHA-256: $hash"
+          $shaFile = "$zip.sha256"
+          if (Test-Path $shaFile) {
+            $content = Get-Content $shaFile -Raw
+            Write-Host "SHA file content: $content"
+            if (-not $content.Contains($hash)) { throw "SHA file mismatch" }
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RisenTeamSchedule-Windows-x64
+          path: |
+            dist/RisenTeamSchedule-Windows-x64.zip
+            dist/RisenTeamSchedule-Windows-x64.zip.sha256
+            dist/releases/win-x64/RisenTeamSchedule/release-manifest.json
+
+      - name: Post final failure comment to PR (Windows)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const os = require('os');
+            let logContent = '';
+            // List dist files first for debugging persistence
+            try {
+              const distFiles = fs.existsSync('dist') ? fs.readdirSync('dist') : [];
+              logContent += `=== dist/ listing: ${distFiles.join(', ')} ===\n\n`;
+              for (const f of distFiles.filter(f => f.includes('smoke') || f.includes('launcher') || f.includes('release') || f.includes('server'))) {
+                try {
+                  const stat = fs.statSync(path.join('dist', f));
+                  logContent += `dist/${f}: ${stat.size} bytes, mtime ${stat.mtime}\n`;
+                } catch {}
+              }
+              logContent += '\n';
+            } catch (e) {
+              logContent += `Failed to list dist: ${e.message}\n\n`;
+            }
+            try {
+              const failLog = fs.existsSync('dist/smoke-failure.txt') ? fs.readFileSync('dist/smoke-failure.txt', 'utf8').slice(-30000) : 'no smoke-failure.txt';
+              logContent += `=== Smoke failure (dist/smoke-failure.txt) ===\n${failLog}\n\n`;
+            } catch (e) {
+              logContent += `Failed to read smoke-failure: ${e.message}\n\n`;
+            }
+            try {
+              const smokeLog = fs.existsSync('dist/smoke-win-x64.log') ? fs.readFileSync('dist/smoke-win-x64.log', 'utf8').slice(-30000) : 'no smoke log';
+              logContent += `=== Smoke log (dist/smoke-win-x64.log) ===\n${smokeLog}\n\n`;
+            } catch (e) {
+              logContent += `Failed to read smoke log: ${e.message}\n\n`;
+            }
+            try {
+              const launcherLog = fs.existsSync('dist/launcher-output-win.txt') ? fs.readFileSync('dist/launcher-output-win.txt', 'utf8').slice(-20000) : 'no launcher log';
+              logContent += `=== Launcher output (dist/launcher-output-win.txt) ===\n${launcherLog}\n\n`;
+            } catch (e) {
+              logContent += `Failed to read launcher log: ${e.message}\n\n`;
+            }
+            try {
+              const launcher2 = fs.existsSync('dist/launcher-output2-win.txt') ? fs.readFileSync('dist/launcher-output2-win.txt', 'utf8').slice(-10000) : 'no second launcher log';
+              logContent += `=== Second launcher ===\n${launcher2}\n\n`;
+            } catch {}
+            try {
+              const releaseLog = fs.existsSync('dist/release-win-x64.log') ? fs.readFileSync('dist/release-win-x64.log', 'utf8').slice(-15000) : 'no release log';
+              logContent += `=== Release log ===\n${releaseLog}\n\n`;
+            } catch (e) {
+              logContent += `Failed to read release log: ${e.message}\n\n`;
+            }
+            try {
+              const serverLog = fs.existsSync('dist/server-last.log') ? fs.readFileSync('dist/server-last.log', 'utf8').slice(-15000) : 'no server-last.log';
+              logContent += `=== Server last log (dist/server-last.log) ===\n${serverLog}\n\n`;
+            } catch {}
+            try {
+              const zipLog = fs.existsSync('dist/zip-extract-win.log') ? fs.readFileSync('dist/zip-extract-win.log', 'utf8').slice(-20000) : 'no zip-extract log';
+              logContent += `=== ZIP extract log (dist/zip-extract-win.log) ===\n${zipLog}\n\n`;
+            } catch {}
+            try {
+              const zipLauncher = fs.existsSync('dist/zip-launcher-output-win.txt') ? fs.readFileSync('dist/zip-launcher-output-win.txt', 'utf8').slice(-20000) : 'no zip launcher log';
+              logContent += `=== ZIP launcher output ===\n${zipLauncher}\n\n`;
+            } catch {}
+            try {
+              const zipServer = fs.existsSync('dist/zip-server-last.log') ? fs.readFileSync('dist/zip-server-last.log', 'utf8').slice(-15000) : 'no zip server log';
+              logContent += `=== ZIP server last log ===\n${zipServer}\n\n`;
+            } catch {}
+            try {
+              const localAppData = process.env.LOCALAPPDATA || '';
+              const logDir = path.join(localAppData, 'RisenTeamSchedule-v1.0', 'logs');
+              logContent += `=== LOCALAPPDATA=${localAppData}, logDir exists=${fs.existsSync(logDir)} ===\n`;
+              if (fs.existsSync(logDir)) {
+                const files = fs.readdirSync(logDir).filter(f => f.startsWith('server-')).sort().slice(-2);
+                logContent += `Log files: ${files.join(', ')}\n`;
+                for (const file of files) {
+                  try {
+                    const content = fs.readFileSync(path.join(logDir, file), 'utf8').slice(-10000);
+                    logContent += `=== ${file} ===\n${content}\n\n`;
+                  } catch {}
+                }
+              }
+            } catch (e) {
+              logContent += `Failed to read LOCALAPPDATA logs: ${e.message}\n`;
+            }
+            try {
+              const tempDir = os.tmpdir();
+              logContent += `=== os.tmpdir()=${tempDir} ===\n`;
+              const tempFiles = fs.existsSync(tempDir) ? fs.readdirSync(tempDir).filter(f => f.startsWith('RisenTest-')) : [];
+              logContent += `=== Temp RisenTest dirs: ${tempFiles.slice(-5).join(', ')} ===\n`;
+              for (const dir of tempFiles.slice(-2)) {
+                const fullDir = path.join(tempDir, dir);
+                try {
+                  const files = fs.existsSync(fullDir) ? fs.readdirSync(fullDir) : [];
+                  logContent += `--- ${fullDir}: ${files.join(', ')} ---\n`;
+                  for (const file of files.filter(f => f.includes('launcher')).slice(0, 3)) {
+                    try {
+                      const content = fs.readFileSync(path.join(fullDir, file), 'utf8').slice(-15000);
+                      logContent += `=== ${dir}/${file} ===\n${content}\n\n`;
+                    } catch {}
+                  }
+                } catch (err) {
+                  logContent += `Failed to list ${fullDir}: ${err.message}\n`;
+                }
+              }
+            } catch (e) {
+              logContent += `Failed to list temp: ${e.message}\n`;
+            }
+            if (logContent.length > 60000) logContent = logContent.slice(-60000);
+            const body = `**Windows x64 job failed** in run ${{ github.run_id }} (attempt ${{ github.run_attempt }})\n\nBranch: arena/portable-release\n\n\`\`\`\n${logContent}\n\`\`\``;
+            let prNumber = 13;
+            try {
+              const prs = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner}:arena/portable-release`,
+                state: 'open'
+              });
+              if (prs.data.length > 0) prNumber = prs.data[0].number;
+            } catch {}
+            console.log(`Posting to PR #${prNumber}, length ${logContent.length}`);
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body
+              });
+            } catch (err) {
+              console.log(`Failed to post comment: ${err.message}`);
+            }
+
+  macos-apple-silicon:
+    name: macOS Apple Silicon (ARM64)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify runner architecture is arm64
+        run: |
+          ARCH=$(uname -m)
+          echo "uname -m: $ARCH"
+          if [ "$ARCH" != "arm64" ]; then
+            echo "Expected arm64 runner, got $ARCH"
+            exit 1
+          fi
+          echo "Runner architecture verified: arm64"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: 'npm'
+
+      - name: Install dependencies safely
+        run: npm ci --ignore-scripts
+
+      - name: Initialize the native SQLite addon
+        run: npm rebuild better-sqlite3 --foreground-scripts
+
+      - name: Verify better-sqlite3 works natively
+        run: |
+          node -e "const Database = require('better-sqlite3'); const db = new Database(':memory:'); console.log(db.prepare('select 1 as value').get()); db.close(); console.log('better-sqlite3 OK')"
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Vitest
+        run: npx vitest run
+
+      - name: Build
+        run: npm run build
+
+      - name: Prepare portable
+        run: npm run prepare:portable
+
+      - name: Verify portable layout
+        run: |
+          portable="dist/portable/RisenTeamSchedule"
+          test -f "$portable/server.js" || (echo "server.js missing" && exit 1)
+          test -d "$portable/.next/static" || (echo ".next/static missing" && exit 1)
+          test -d "$portable/public" || (echo "public missing" && exit 1)
+          test -f "$portable/start.bat" || (echo "start.bat missing" && exit 1)
+          test -f "$portable/start.command" || (echo "start.command missing" && exit 1)
+          test -d "$portable/node_modules/better-sqlite3" || (echo "better-sqlite3 missing" && exit 1)
+          # Check not symlink
+          if [ -L "$portable/node_modules/better-sqlite3" ]; then
+            echo "better-sqlite3 is symlink - should be real"
+            exit 1
+          fi
+          echo "better-sqlite3 is real directory"
+          # No symlink in bundle
+          if find "$portable" -type l | grep -q .; then
+            echo "Found symlinks in portable bundle:"
+            find "$portable" -type l -ls
+            exit 1
+          fi
+          echo "No symlinks - EPERM fix verified"
+          echo "Portable layout verified"
+
+      - name: Pre-download Node runtime (darwin-arm64)
+        run: |
+          lockFile="scripts/node-runtime-lock.json"
+          url=$(node -p "require('./$lockFile').targets['darwin-arm64'].url")
+          filename=$(node -p "require('./$lockFile').targets['darwin-arm64'].filename")
+          sha=$(node -p "require('./$lockFile').targets['darwin-arm64'].sha256")
+          cacheDir="dist/cache/node-runtime"
+          mkdir -p "$cacheDir"
+          dest="$cacheDir/$filename"
+          if [ -f "$dest" ]; then
+            existing=$(shasum -a 256 "$dest" | awk '{print $1}')
+            if [ "$existing" = "$sha" ]; then
+              echo "Cached archive OK: $dest"
+            else
+              echo "Checksum mismatch cached $existing vs $sha, re-downloading"
+              rm -f "$dest"
+            fi
+          fi
+          if [ ! -f "$dest" ]; then
+            echo "Downloading $url to $dest"
+            curl -L --fail -o "$dest" "$url"
+            actual=$(shasum -a 256 "$dest" | awk '{print $1}')
+            echo "Downloaded SHA: $actual expected $sha"
+            if [ "$actual" != "$sha" ]; then echo "Checksum mismatch"; exit 1; fi
+          fi
+          echo "Node archive ready: $dest"
+
+      - name: Release portable (darwin-arm64)
+        run: |
+          npm run release:portable -- --target=darwin-arm64 2>&1 | tee dist/release-darwin-arm64.log
+          exitCode=${PIPESTATUS[0]}
+          if [ $exitCode -ne 0 ]; then echo "release failed $exitCode"; exit $exitCode; fi
+
+      - name: Report release failure (macOS ARM64)
+        if: failure()
+        run: |
+          echo "=== Release failure log ==="
+          cat dist/release-darwin-arm64.log 2>/dev/null | tail -n 200 || true
+          echo "=== End log ==="
+
+      - name: Upload release log on failure (ARM64)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-log-darwin-arm64
+          path: dist/release-darwin-arm64.log
+          if-no-files-found: warn
+
+      - name: Verify release layout and bundled Node
+        run: |
+          release="dist/releases/darwin-arm64/RisenTeamSchedule"
+          zip="dist/RisenTeamSchedule-macOS-AppleSilicon.zip"
+          test -f "$release/runtime/node/bin/node" || (echo "Bundled node missing" && exit 1)
+          test -f "$zip" || (echo "ZIP missing" && exit 1)
+          "$release/runtime/node/bin/node" --version
+          ver=$("$release/runtime/node/bin/node" --version)
+          if [ "$ver" != "v22.23.2" ]; then
+            echo "Version mismatch: expected v22.23.2, got $ver"
+            exit 1
+          fi
+          arch=$("$release/runtime/node/bin/node" -p "process.arch")
+          echo "Bundled Node arch: $arch"
+          if [ "$arch" != "arm64" ]; then
+            echo "Arch mismatch: expected arm64, got $arch"
+            exit 1
+          fi
+          # Check binary is arm64
+          file "$release/runtime/node/bin/node" | grep -q "arm64" || echo "file check: $(file $release/runtime/node/bin/node)"
+          # Verify release-manifest
+          test -f "$release/release-manifest.json" || (echo "release-manifest missing" && exit 1)
+          cat "$release/release-manifest.json"
+          # README
+          test -f "$release/README.txt" || (echo "README missing" && exit 1)
+          grep -q "start.command" "$release/README.txt" || (echo "README should mention start.command" && exit 1)
+
+      - name: Verify v1 release contract
+        run: |
+          node -e 'const fs = require("node:fs"); const root = "dist/releases/darwin-arm64/RisenTeamSchedule/"; const m = JSON.parse(fs.readFileSync(root + "release-manifest.json", "utf8")); const b = JSON.parse(fs.readFileSync(root + "manifest.json", "utf8")); if (m.app !== "risen-team-schedule-builder-v1" || m.port !== 3178 || m.hostname !== "127.0.0.1" || !m.loopbackOnly || m.userData.windows !== "%LOCALAPPDATA%\\RisenTeamSchedule-v1.0" || m.userData.macos !== "~/Library/Application Support/RisenTeamSchedule-v1.0" || m.userData.packaged !== false || b.runtime.minimumNodeMajor !== 22) throw new Error("v1 release contract mismatch"); console.log("v1 release contract verified");'
+
+      - name: Test path with spaces
+        run: |
+          set -x
+          source="dist/releases/darwin-arm64/RisenTeamSchedule"
+          destRoot="/tmp/Risen Team Portable Test"
+          dest="$destRoot/RisenTeamSchedule"
+          echo "Removing $destRoot"
+          rm -rf "$destRoot"
+          echo "Creating $destRoot"
+          mkdir -p "$destRoot"
+          echo "Copying to path with spaces: $dest"
+          echo "Source size: $(du -sh "$source" | cut -f1)"
+          cp -R "$source" "$dest"
+          echo "Copy finished"
+          test -f "$dest/start.command" || (echo "start.command missing in spaced path" && exit 1)
+          test -f "$dest/runtime/node/bin/node" || (echo "bundled node missing in spaced path" && exit 1)
+          echo "Path with spaces verified"
+          rm -rf "$destRoot"
+
+      - name: Smoke test - real start.command with bundled Node
+        run: |
+          set -euo pipefail
+          # Make absolute path BEFORE cd to avoid relative-path bug after cd
+          release="$(cd dist/releases/darwin-arm64/RisenTeamSchedule && pwd)"
+          echo "Release absolute path: $release"
+          testDbDir=$(mktemp -d /tmp/RisenTest-XXXXXX)
+          testDbPath="$testDbDir/risen-team.db"
+          export RISEN_DB_PATH="$testDbPath"
+          echo "Using temporary DB: $testDbPath"
+
+          # Ensure port free
+          if curl --silent --max-time 2 http://127.0.0.1:3178/api/health >/dev/null 2>&1; then
+            echo "Port 3178 already in use, trying to free..."
+          fi
+
+          echo "Launching start.command --no-browser from $release"
+          cd "$release"
+          chmod +x ./start.command
+          # Capture output
+          outputLog="$testDbDir/launcher-output.txt"
+          ./start.command --no-browser > "$outputLog" 2>&1 &
+          launcherPid=$!
+          echo "Launcher PID: $launcherPid"
+          sleep 2
+
+          cat "$outputLog" || true
+
+          if ! grep -q "Node (bundled)" "$outputLog"; then
+            echo "Bundled Node not selected - should contain 'Node (bundled)'"
+            cat "$outputLog"
+            exit 1
+          fi
+          echo "Bundled Node proof verified"
+
+          # Wait for health
+          maxWait=45
+          deadline=$(( $(date +%s) + maxWait ))
+          healthy=0
+          while [ $(date +%s) -lt $deadline ]; do
+            if curl --silent --max-time 3 http://127.0.0.1:3178/api/health | grep -q "risen-team-schedule-builder-v1"; then
+              code=$(curl --silent --output /tmp/health.json --write-out '%{http_code}' http://127.0.0.1:3178/api/health || true)
+              if [ "$code" = "200" ]; then
+                healthy=1
+                break
+              fi
+            fi
+            sleep 0.5
+          done
+
+          if [ $healthy -ne 1 ]; then
+            echo "Server did not become healthy within $maxWait seconds"
+            cat "$testDbDir"/*.log 2>/dev/null || true
+            cat ~/Library/Application\ Support/RisenTeamSchedule/logs/server-*.log 2>/dev/null | tail -n 50 || true
+            exit 1
+          fi
+
+          echo "Health OK"
+          cat /tmp/health.json
+
+          # Verify binds only to 127.0.0.1 using numeric lsof output (-nP) to avoid localhost/phonex-port resolution
+          echo "Checking bind with lsof -nP -iTCP:3178 -sTCP:LISTEN"
+          lsof -nP -iTCP:3178 -sTCP:LISTEN || true
+          if lsof -nP -iTCP:3178 -sTCP:LISTEN | grep -q "0.0.0.0:3178\|*:3178"; then
+            echo "Server binds to 0.0.0.0 or *, should be 127.0.0.1 only"
+            lsof -nP -iTCP:3178 -sTCP:LISTEN
+            exit 1
+          fi
+          if ! lsof -nP -iTCP:3178 -sTCP:LISTEN | grep -q "127.0.0.1:3178"; then
+            echo "Server not bound to 127.0.0.1:3178 (numeric check)"
+            lsof -nP -iTCP:3178 -sTCP:LISTEN
+            echo "Trying non-numeric for debug:"
+            lsof -i :3178 -sTCP:LISTEN || true
+            exit 1
+          fi
+          echo "Binds only to 127.0.0.1:3178 verified (numeric)"
+
+          # Verify /schedule
+          code=$(curl --silent --output /tmp/schedule.html --write-out '%{http_code}' http://127.0.0.1:3178/schedule || true)
+          if [ "$code" != "200" ]; then
+            echo "/schedule returned $code"
+            exit 1
+          fi
+          echo "/schedule 200 OK"
+
+          # Verify /api/workspace
+          code=$(curl --silent --output /tmp/workspace.json --write-out '%{http_code}' http://127.0.0.1:3178/api/workspace || true)
+          if [ "$code" != "200" ]; then
+            echo "/api/workspace returned $code"
+            exit 1
+          fi
+          echo "/api/workspace 200 OK"
+
+          # Verify SQLite DB created and user_version =1
+          sleep 2
+          if [ ! -f "$testDbPath" ]; then
+            echo "SQLite DB not created at $testDbPath"
+            exit 1
+          fi
+          echo "SQLite DB created"
+
+          # Use absolute bundled Node path (or ./runtime/... after cd) - fixed relative-path bug
+          ./runtime/node/bin/node - <<JS
+          const Database = require('better-sqlite3');
+          const db = new Database(process.env.RISEN_DB_PATH);
+          const row = db.prepare('PRAGMA user_version').get();
+          console.log('user_version=' + row.user_version);
+          if (row.user_version !== 1) throw new Error('user_version expected 1, got ' + row.user_version);
+          db.close();
+          JS
+
+          # Test repeated start
+          echo "Testing repeated start..."
+          ./start.command --no-browser > "$testDbDir/launcher-output2.txt" 2>&1 || true
+          cat "$testDbDir/launcher-output2.txt"
+          if ! grep -q "Already running" "$testDbDir/launcher-output2.txt"; then
+            echo "Repeated start should report Already running"
+            exit 1
+          fi
+          echo "Repeated start verified"
+
+          # Cleanup: stop server
+          echo "Stopping test server..."
+          serverPid=$(lsof -nP -ti :3178 -sTCP:LISTEN || lsof -ti :3178 -sTCP:LISTEN || true)
+          if [ -n "$serverPid" ]; then
+            echo "Killing server PID $serverPid"
+            kill $serverPid || true
+          fi
+          sleep 2
+
+          # Verify port freed
+          if curl --silent --max-time 2 http://127.0.0.1:3178/api/health >/dev/null 2>&1; then
+            echo "Server still running after stop"
+            exit 1
+          fi
+          echo "Server stopped"
+
+          rm -rf "$testDbDir"
+          echo "macOS ARM64 smoke test SUCCESS"
+
+      - name: Verify ZIP extraction and executable bit
+        run: |
+          zip="dist/RisenTeamSchedule-macOS-AppleSilicon.zip"
+          extractRoot="/tmp/RisenZipTest"
+          rm -rf "$extractRoot"
+          mkdir -p "$extractRoot"
+          unzip -o "$zip" -d "$extractRoot"
+          extracted="$extractRoot/RisenTeamSchedule"
+          test -f "$extracted/server.js" || (echo "server.js missing" && exit 1)
+          test -f "$extracted/runtime/node/bin/node" || (echo "bundled node missing" && exit 1)
+          # Check executable bit
+          if [ ! -x "$extracted/start.command" ]; then
+            echo "start.command not executable after ZIP extraction"
+            ls -l "$extracted/start.command"
+            exit 1
+          fi
+          echo "ZIP extraction and executable bit verified"
+          # Run extracted again
+          testDbDir=$(mktemp -d /tmp/RisenZipTestDB-XXXXXX)
+          export RISEN_DB_PATH="$testDbDir/risen-team.db"
+          cd "$extracted"
+          chmod +x ./start.command
+          ./start.command --no-browser > "$testDbDir/out.txt" 2>&1 &
+          sleep 3
+          curl --silent --max-time 5 http://127.0.0.1:3178/api/health | grep -q "risen-team-schedule-builder-v1" || (echo "Extracted release not healthy" && exit 1)
+          echo "Extracted release runs OK"
+          serverPid=$(lsof -ti :3178 -sTCP:LISTEN || true)
+          if [ -n "$serverPid" ]; then kill $serverPid || true; fi
+          sleep 2
+          rm -rf "$testDbDir" "$extractRoot"
+
+      - name: Generate SHA-256
+        run: |
+          zip="dist/RisenTeamSchedule-macOS-AppleSilicon.zip"
+          shasum -a 256 "$zip"
+          cat "$zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RisenTeamSchedule-macOS-AppleSilicon
+          path: |
+            dist/RisenTeamSchedule-macOS-AppleSilicon.zip
+            dist/RisenTeamSchedule-macOS-AppleSilicon.zip.sha256
+            dist/releases/darwin-arm64/RisenTeamSchedule/release-manifest.json
+
+  macos-intel:
+    name: macOS Intel (x64)
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify runner architecture is x86_64
+        run: |
+          ARCH=$(uname -m)
+          echo "uname -m: $ARCH"
+          if [ "$ARCH" != "x86_64" ]; then
+            echo "Expected x86_64 runner, got $ARCH"
+            exit 1
+          fi
+          echo "Runner architecture verified: x86_64"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: 'npm'
+
+      - name: Install dependencies safely
+        run: npm ci --ignore-scripts
+
+      - name: Initialize the native SQLite addon
+        run: npm rebuild better-sqlite3 --foreground-scripts
+
+      - name: Verify better-sqlite3 works natively
+        run: |
+          node -e "const Database = require('better-sqlite3'); const db = new Database(':memory:'); console.log(db.prepare('select 1 as value').get()); db.close(); console.log('better-sqlite3 OK')"
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Vitest
+        run: npx vitest run
+
+      - name: Build
+        run: npm run build
+
+      - name: Prepare portable
+        run: npm run prepare:portable
+
+      - name: Verify portable layout
+        run: |
+          portable="dist/portable/RisenTeamSchedule"
+          test -f "$portable/server.js" || (echo "server.js missing" && exit 1)
+          test -d "$portable/.next/static" || (echo ".next/static missing" && exit 1)
+          test -f "$portable/start.command" || (echo "start.command missing" && exit 1)
+          test -d "$portable/node_modules/better-sqlite3" || (echo "better-sqlite3 missing" && exit 1)
+          if [ -L "$portable/node_modules/better-sqlite3" ]; then echo "symlink found" && exit 1; fi
+          if find "$portable" -type l | grep -q .; then find "$portable" -type l -ls; exit 1; fi
+          echo "Portable layout verified"
+
+      - name: Pre-download Node runtime (darwin-x64)
+        run: |
+          lockFile="scripts/node-runtime-lock.json"
+          url=$(node -p "require('./$lockFile').targets['darwin-x64'].url")
+          filename=$(node -p "require('./$lockFile').targets['darwin-x64'].filename")
+          sha=$(node -p "require('./$lockFile').targets['darwin-x64'].sha256")
+          cacheDir="dist/cache/node-runtime"
+          mkdir -p "$cacheDir"
+          dest="$cacheDir/$filename"
+          if [ -f "$dest" ]; then
+            existing=$(shasum -a 256 "$dest" | awk '{print $1}')
+            if [ "$existing" = "$sha" ]; then
+              echo "Cached archive OK: $dest"
+            else
+              echo "Checksum mismatch cached $existing vs $sha, re-downloading"
+              rm -f "$dest"
+            fi
+          fi
+          if [ ! -f "$dest" ]; then
+            echo "Downloading $url to $dest"
+            curl -L --fail -o "$dest" "$url"
+            actual=$(shasum -a 256 "$dest" | awk '{print $1}')
+            echo "Downloaded SHA: $actual expected $sha"
+            if [ "$actual" != "$sha" ]; then echo "Checksum mismatch"; exit 1; fi
+          fi
+          echo "Node archive ready: $dest"
+
+      - name: Release portable (darwin-x64)
+        run: |
+          npm run release:portable -- --target=darwin-x64 2>&1 | tee dist/release-darwin-x64.log
+          exitCode=${PIPESTATUS[0]}
+          if [ $exitCode -ne 0 ]; then echo "release failed $exitCode"; exit $exitCode; fi
+
+      - name: Report release failure (macOS Intel)
+        if: failure()
+        run: |
+          echo "=== Release failure log ==="
+          cat dist/release-darwin-x64.log 2>/dev/null | tail -n 200 || true
+          echo "=== End log ==="
+
+      - name: Upload release log on failure (Intel)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-log-darwin-x64
+          path: dist/release-darwin-x64.log
+          if-no-files-found: warn
+
+      - name: Verify release layout and bundled Node
+        run: |
+          release="dist/releases/darwin-x64/RisenTeamSchedule"
+          zip="dist/RisenTeamSchedule-macOS-Intel.zip"
+          test -f "$release/runtime/node/bin/node" || (echo "Bundled node missing" && exit 1)
+          test -f "$zip" || (echo "ZIP missing" && exit 1)
+          "$release/runtime/node/bin/node" --version
+          ver=$("$release/runtime/node/bin/node" --version)
+          if [ "$ver" != "v22.23.2" ]; then echo "Version mismatch $ver"; exit 1; fi
+          arch=$("$release/runtime/node/bin/node" -p "process.arch")
+          echo "Arch: $arch"
+          if [ "$arch" != "x64" ]; then echo "Arch mismatch"; exit 1; fi
+          file "$release/runtime/node/bin/node"
+
+      - name: Verify v1 release contract
+        run: |
+          node -e 'const fs = require("node:fs"); const root = "dist/releases/darwin-x64/RisenTeamSchedule/"; const m = JSON.parse(fs.readFileSync(root + "release-manifest.json", "utf8")); const b = JSON.parse(fs.readFileSync(root + "manifest.json", "utf8")); if (m.app !== "risen-team-schedule-builder-v1" || m.port !== 3178 || m.hostname !== "127.0.0.1" || !m.loopbackOnly || m.userData.windows !== "%LOCALAPPDATA%\\RisenTeamSchedule-v1.0" || m.userData.macos !== "~/Library/Application Support/RisenTeamSchedule-v1.0" || m.userData.packaged !== false || b.runtime.minimumNodeMajor !== 22) throw new Error("v1 release contract mismatch"); console.log("v1 release contract verified");'
+
+      - name: Test path with spaces
+        run: |
+          set -x
+          source="dist/releases/darwin-x64/RisenTeamSchedule"
+          destRoot="/tmp/Risen Team Portable Test"
+          dest="$destRoot/RisenTeamSchedule"
+          echo "Removing $destRoot"
+          rm -rf "$destRoot"
+          echo "Creating $destRoot"
+          mkdir -p "$destRoot"
+          echo "Source size: $(du -sh "$source" | cut -f1)"
+          echo "Copying to path with spaces: $dest"
+          cp -R "$source" "$dest"
+          echo "Copy finished"
+          test -f "$dest/start.command"
+          test -f "$dest/runtime/node/bin/node"
+          echo "Path with spaces OK"
+          rm -rf "$destRoot"
+
+      - name: Smoke test - real start.command
+        run: |
+          set -euo pipefail
+          # Make absolute path BEFORE cd to avoid relative-path bug
+          release="$(cd dist/releases/darwin-x64/RisenTeamSchedule && pwd)"
+          echo "Release absolute path: $release"
+          testDbDir=$(mktemp -d /tmp/RisenTest-XXXXXX)
+          export RISEN_DB_PATH="$testDbDir/risen-team.db"
+          echo "DB: $RISEN_DB_PATH"
+          cd "$release"
+          chmod +x ./start.command
+          outputLog="$testDbDir/launcher-output.txt"
+          ./start.command --no-browser > "$outputLog" 2>&1 &
+          sleep 2
+          cat "$outputLog"
+          grep -q "Node (bundled)" "$outputLog" || (echo "Bundled Node not selected" && exit 1)
+          maxWait=45
+          deadline=$(( $(date +%s) + maxWait ))
+          healthy=0
+          while [ $(date +%s) -lt $deadline ]; do
+            if curl --silent --max-time 3 http://127.0.0.1:3178/api/health | grep -q "risen-team-schedule-builder-v1"; then
+              code=$(curl --silent --output /tmp/health.json --write-out '%{http_code}' http://127.0.0.1:3178/api/health || true)
+              if [ "$code" = "200" ]; then healthy=1; break; fi
+            fi
+            sleep 0.5
+          done
+          if [ $healthy -ne 1 ]; then echo "Not healthy"; exit 1; fi
+          echo "Health OK"
+          cat /tmp/health.json
+
+          # Verify binds only to 127.0.0.1 using numeric lsof
+          echo "Checking bind with lsof -nP -iTCP:3178 -sTCP:LISTEN"
+          lsof -nP -iTCP:3178 -sTCP:LISTEN || true
+          if lsof -nP -iTCP:3178 -sTCP:LISTEN | grep -q "0.0.0.0:3178\|*:3178"; then
+            echo "Server binds to 0.0.0.0 or *, should be 127.0.0.1 only"
+            lsof -nP -iTCP:3178 -sTCP:LISTEN
+            exit 1
+          fi
+          if ! lsof -nP -iTCP:3178 -sTCP:LISTEN | grep -q "127.0.0.1:3178"; then
+            echo "Server not bound to 127.0.0.1:3178 (numeric)"
+            lsof -nP -iTCP:3178 -sTCP:LISTEN
+            exit 1
+          fi
+          echo "Binds only to 127.0.0.1:3178 verified (numeric)"
+
+          code=$(curl --silent --output /tmp/schedule.html --write-out '%{http_code}' http://127.0.0.1:3178/schedule || true)
+          if [ "$code" != "200" ]; then echo "/schedule $code"; exit 1; fi
+          echo "/schedule 200 OK"
+          code=$(curl --silent --output /tmp/workspace.json --write-out '%{http_code}' http://127.0.0.1:3178/api/workspace || true)
+          if [ "$code" != "200" ]; then echo "/api/workspace $code"; exit 1; fi
+          echo "/api/workspace 200 OK"
+          sleep 1
+          test -f "$RISEN_DB_PATH" || (echo "DB not created" && exit 1)
+          echo "DB created at $RISEN_DB_PATH"
+
+          # Fixed relative-path bug: use ./runtime/... after cd, not $release/...
+          ./runtime/node/bin/node - <<JS
+          const Database = require('better-sqlite3');
+          const db = new Database(process.env.RISEN_DB_PATH);
+          const row = db.prepare('PRAGMA user_version').get();
+          console.log('user_version=' + row.user_version);
+          if (row.user_version !== 1) throw new Error('user_version expected 1');
+          db.close();
+          JS
+
+          echo "Testing repeated start"
+          ./start.command --no-browser > "$testDbDir/out2.txt" 2>&1 || true
+          cat "$testDbDir/out2.txt"
+          grep -q "Already running" "$testDbDir/out2.txt" || (echo "Repeated start failed" && exit 1)
+          echo "Repeated start verified"
+          serverPid=$(lsof -nP -ti :3178 -sTCP:LISTEN || lsof -ti :3178 -sTCP:LISTEN || true)
+          if [ -n "$serverPid" ]; then
+            echo "Killing server PID $serverPid"
+            kill $serverPid || true
+          fi
+          sleep 2
+          rm -rf "$testDbDir"
+          echo "macOS Intel smoke SUCCESS"
+
+      - name: Verify ZIP extraction and executable bit
+        run: |
+          zip="dist/RisenTeamSchedule-macOS-Intel.zip"
+          extractRoot="/tmp/RisenZipTest"
+          rm -rf "$extractRoot"
+          mkdir -p "$extractRoot"
+          unzip -o "$zip" -d "$extractRoot"
+          extracted="$extractRoot/RisenTeamSchedule"
+          test -f "$extracted/server.js"
+          test -f "$extracted/runtime/node/bin/node"
+          test -x "$extracted/start.command" || (echo "not executable" && ls -l "$extracted/start.command" && exit 1)
+          echo "ZIP extraction OK"
+          testDbDir=$(mktemp -d /tmp/RisenZipTestDB-XXXXXX)
+          export RISEN_DB_PATH="$testDbDir/risen-team.db"
+          cd "$extracted"
+          chmod +x ./start.command
+          ./start.command --no-browser > "$testDbDir/out.txt" 2>&1 &
+          sleep 3
+          curl --silent --max-time 5 http://127.0.0.1:3178/api/health | grep -q "risen-team-schedule-builder-v1" || (echo "Extracted not healthy" && exit 1)
+          serverPid=$(lsof -ti :3178 -sTCP:LISTEN || true)
+          if [ -n "$serverPid" ]; then kill $serverPid || true; fi
+          sleep 2
+          rm -rf "$testDbDir" "$extractRoot"
+
+      - name: Generate SHA-256
+        run: |
+          zip="dist/RisenTeamSchedule-macOS-Intel.zip"
+          shasum -a 256 "$zip"
+          cat "$zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RisenTeamSchedule-macOS-Intel
+          path: |
+            dist/RisenTeamSchedule-macOS-Intel.zip
+            dist/RisenTeamSchedule-macOS-Intel.zip.sha256
+            dist/releases/darwin-x64/RisenTeamSchedule/release-manifest.json

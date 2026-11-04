@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --ui-background: #08090c;
+  --ui-surface: #0b0d13;
+  --ui-control: #12151d;
+  --ui-border: #1e222c;
+  --ui-divider: #1a1e27;
+  --ui-text: #f8fafc;
+  --ui-muted: #8b93a6;
+  --ui-radius: 8px;
+}
+
+.risen-modal::backdrop {
+  background: rgb(0 0 0 / 0.7);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+html,
+body {
+  background-color: #08090d;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  scrollbar-color: #2a3040 #0b0d12;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  height: 10px;
+  width: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #0b0d12;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #262c3a;
+  border-radius: 6px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #333b4d;
+}
+
+input[type="time"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.7);
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #ffffff;
+  }
+  .print-area {
+    box-shadow: none !important;
+    border: none !important;
+  }
+}

@@ -1,0 +1,22 @@
+DejaVu Sans (RisenSans.ttf / RisenSans-Bold.ttf)
+================================================
+
+Fonts are embedded into exported PDF files so Ukrainian (Cyrillic) text is
+rendered correctly on any computer, even if the font is not installed there.
+
+DejaVu fonts are based on the Bitstream Vera Fonts and are released under a
+free, permissively redistributable licence:
+
+  Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
+  Bitstream Vera is a trademark of Bitstream, Inc.
+  DejaVu changes are in public domain.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of the fonts accompanying this license ("Fonts") and associated documentation
+  files (the "Font Software"), to reproduce and distribute the Font Software,
+  including without limitation the rights to use, copy, merge, publish,
+  distribute, and/or sell copies of the Font Software, and to permit persons to
+  whom the Font Software is furnished to do so, subject to the conditions in the
+  full Bitstream Vera licence (included with the DejaVu font distribution).
+
+Only the glyphs that are actually used are embedded in each exported PDF.

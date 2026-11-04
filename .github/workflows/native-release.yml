@@ -1,0 +1,81 @@
+name: Reviewed native desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      verification:
+        description: Committed JSON report with passing tests, audit, codeReview and current sourceDigest
+        required: true
+        default: docs/audit/native-verification.json
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: win-x64
+          - runner: macos-15
+            target: darwin-arm64
+          - runner: macos-15-intel
+            target: darwin-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install reviewed dependency tree
+        run: npm ci --ignore-scripts
+      - name: Initialize native SQLite for this target
+        run: npm rebuild better-sqlite3 --foreground-scripts
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+      - name: Build only after the review report matches this source tree
+        env:
+          VERIFICATION_REPORT: ${{ inputs.verification }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: node scripts/build-native-release.mjs
+      - name: Smoke native Windows startup and graceful shutdown in an isolated project
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $smokeRoot = Join-Path $env:RUNNER_TEMP ('Risen Team smoke ' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+          @{ format='risen-team-project'; formatVersion=1; workspaceId=[guid]::NewGuid().ToString(); createdAt=[DateTime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $smokeRoot 'project.json') -Encoding utf8NoBOM
+          $launcherPath = Join-Path $PWD 'dist/native-release/win-x64/RisenTeamSchedule/Risen Team.exe'
+          $processInfo = [System.Diagnostics.ProcessStartInfo]::new($launcherPath)
+          $processInfo.UseShellExecute = $false
+          $processInfo.ArgumentList.Add('--smoke-test=' + $smokeRoot)
+          $launched = [System.Diagnostics.Process]::Start($processInfo)
+          if (-not $launched.WaitForExit(90000)) { throw 'Native smoke test timed out' }
+          Get-Content -LiteralPath (Join-Path $smokeRoot 'launcher-smoke.log')
+          if ($launched.ExitCode -ne 0) { throw ('Native smoke failed: ' + $launched.ExitCode) }
+      - name: Verify macOS app bundle structure and signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app="dist/native-release/${{ matrix.target }}/RisenTeamSchedule/Risen Team.app"
+          test -x "$app/Contents/MacOS/RisenTeam"
+          test -s "$app/Contents/Resources/app.icns"
+          test -s "$app/Contents/Resources/menubar.png"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")" = 'app.icns'
+          codesign --verify --deep --strict "$app"
+      - name: Upload native test distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: RisenTeam-native-${{ matrix.target }}
+          path: |
+            dist/RisenTeam-native-${{ matrix.target }}.zip
+            dist/RisenTeam-native-${{ matrix.target }}.zip.sha256
+            dist/native-release/${{ matrix.target }}/RisenTeamSchedule/native-release-manifest.json

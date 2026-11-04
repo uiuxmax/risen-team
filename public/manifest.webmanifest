@@ -1,0 +1,17 @@
+{
+  "name": "Risen Team Schedule Builder v1.0",
+  "short_name": "Risen v1.0",
+  "description": "Локальний конструктор тижневого розкладу тренувань Risen Team з версіями та експортом.",
+  "start_url": "/schedule",
+  "display": "standalone",
+  "background_color": "#08090d",
+  "theme_color": "#08090c",
+  "icons": [
+    {
+      "src": "/logo-sign.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

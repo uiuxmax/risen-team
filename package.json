@@ -1,0 +1,53 @@
+{
+  "name": "risen-team-schedule-builder",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1 --port 3178",
+    "build": "next build",
+    "start": "next start --hostname 127.0.0.1 --port 3178",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "prepare:portable": "node scripts/prepare-portable.mjs",
+    "release:portable": "node scripts/build-portable-release.mjs",
+    "test": "vitest run",
+    "release:native": "node scripts/build-native-release.mjs",
+    "smoke:project": "node scripts/smoke-project.mjs",
+    "smoke:browser": "node scripts/browser-smoke.mjs",
+    "prepare:branding": "node scripts/generate-brand-assets.mjs && node scripts/generate-native-icons.mjs"
+  },
+  "dependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "17.3.1",
+    "drizzle-orm": "0.45.2",
+    "jspdf": "^4.2.1",
+    "next": "16.4.4",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "sharp": "0.35.5",
+    "svg2pdf.js": "^2.8.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.1.17",
+    "@testing-library/react": "16.3.3",
+    "@types/jsdom": "30.0.0",
+    "@types/node": "22.19.15",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "drizzle-kit": "0.31.10",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.4.4",
+    "jsdom": "29.1.1",
+    "playwright-core": "1.64.1",
+    "postcss": "8.5.32",
+    "tailwindcss": "4.1.17",
+    "typescript": "5.9.3",
+    "vitest": "5.1.0"
+  },
+  "description": "Local-first weekly training schedule builder, preview and export studio for Risen Team.",
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
