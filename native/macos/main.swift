@@ -207,7 +207,9 @@ final class Launcher: NSObject, NSApplicationDelegate {
     }
 }
 
-let application = NSApplication.shared
-let delegate = Launcher()
-application.delegate = delegate
-application.run()
+MainActor.assumeIsolated {
+    let application = NSApplication.shared
+    let delegate = Launcher()
+    application.delegate = delegate
+    application.run()
+}
