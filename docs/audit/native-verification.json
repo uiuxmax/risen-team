@@ -1,5 +1,5 @@
 {
-  "sourceDigest": "1b32cfc411933ad066affdfdecb7226a5e35868cfb352d7e25dec261927feb57",
+  "sourceDigest": "837b4b22b93c06366cc0f00bcb75eac95e228991f57d69c412a3705b94d34def",
   "tests": "passed",
   "audit": "passed",
   "codeReview": "passed",
@@ -15,19 +15,20 @@
   "developmentAudit": {
     "info": 0,
     "low": 0,
-    "moderate": 0,
+    "moderate": 12,
     "high": 0,
     "critical": 0,
-    "total": 0,
-    "status": "no-current-findings",
-    "details": "docs/audit/2026-11-05-npm-all.json"
+    "total": 12,
+    "status": "documented-development-tooling-not-packaged",
+    "details": "docs/audit/2026-11-05-npm-all-online.json"
   },
   "platform": "Windows x64 build host",
   "reviewReport": "docs/audit/2026-11-05-review.uk.md",
   "reviews": [
     "Independent server audit: duplicate name export/import regression fixed; 23 hall integration tests passed.",
     "Independent editor audit and review: live autosave approval, localized duplicate names, pointer cancellation and below-threshold rollback reviewed.",
-    "Independent native/release review: macOS Finder reopen handler, transactional timestamps and pinned Windows CI runner reviewed."
+    "Independent native/release review: macOS Finder reopen handler, transactional timestamps and pinned Windows CI runner reviewed.",
+    "Independent CI follow-up review: canonical Windows parent plus filename preserves explicit database path identity; exit status is checked. Online audit corrects the invalid offline zero result; production 0, development 12 moderate, 0 high/critical."
   ],
   "exportVisualReview": "passed: actual Chrome PNG/SVG and desktop/mobile screenshots",
   "manualBrowserReview": "Automated real Chrome acceptance passed; screenshots visually reviewed",
