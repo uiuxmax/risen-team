@@ -20,7 +20,7 @@ interface MigrationPreview {
 export function HallsPanel() {
   const { t, formatDateTime } = useI18n();
   const router = useRouter();
-  const { workspace, schedule, loading, reload, scheduleAction, saveNow, dirty, toast } = useWorkspace();
+  const { workspace, schedule, settings, loading, reload, scheduleAction, saveNow, dirty, toast } = useWorkspace();
   const [editing, setEditing] = useState<{ action: "create" | "rename" | "duplicate"; hall?: Schedule } | null>(null);
   const [name, setName] = useState("");
   const [withoutEvents, setWithoutEvents] = useState(false);
@@ -38,7 +38,8 @@ export function HallsPanel() {
   }, []);
 
   const openEditor = (action: "create" | "rename" | "duplicate", hall?: Schedule) => {
-    setName(action === "duplicate" ? `${hall?.name ?? ""} — ${t("settings.duplicate")}` : hall?.name ?? "");
+    const suffix = ` — ${t("settings.duplicate")}`;
+    setName(action === "duplicate" ? `${(hall?.name ?? "").slice(0, 80 - suffix.length)}${suffix}` : hall?.name ?? "");
     setWithoutEvents(false);
     setEditing({ action, hall });
   };
@@ -62,7 +63,7 @@ export function HallsPanel() {
     setBusy(true);
     try {
       if (dirty) {
-        if (!workspace?.state.settings.autosave && !window.confirm(t("halls.saveBeforeExport"))) return;
+        if (!settings.autosave && !window.confirm(t("halls.saveBeforeExport"))) return;
         if (!(await saveNow())) return;
       }
       const { backup } = await apiRequest<{ backup: unknown }>(`/api/workspace/backup?hallId=${encodeURIComponent(id)}`);

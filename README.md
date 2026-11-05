@@ -1,5 +1,7 @@
 # Risen Team Schedule Builder v1.0
 
+Latest audit and release continuation: [5 November 2026](docs/audit/2026-11-05-review.uk.md).
+
 The current pre-release changes and verification results are recorded in
 [the pre-release report](docs/audit/pre-release-review.uk.md).
 The supplied full logo is the default schedule/export artwork; the sign is used
