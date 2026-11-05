@@ -177,6 +177,13 @@ final class Launcher: NSObject, NSApplicationDelegate {
     @objc private func openProject() { if let workspace { NSWorkspace.shared.open(workspace) } }
     @objc private func quit() { Task { await stop() } }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // Finder reactivates the existing app instead of starting a second
+        // launcher. Initial startup opens the browser after readiness itself.
+        if !stopping { openEditor() }
+        return false
+    }
+
     private func stop() async {
         if stopping { return }; stopping = true
         for _ in 0..<200 {

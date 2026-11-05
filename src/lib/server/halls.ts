@@ -175,7 +175,13 @@ export function hallAction(raw: unknown) {
       id = insertHall(name, source);
       sqlite().prepare("UPDATE schedule_versions SET description=? WHERE schedule_id=?").run("Створено демонстраційний зал із готовим розкладом",id);
     }
-    else if (body.action === "duplicate") { const source = buildSnapshot(hall(body.sourceId ?? body.id ?? "").id); if (body.withoutEvents) source.events = []; id = insertHall(body.name ?? `${source.schedule.name} — копія`, source); }
+    else if (body.action === "duplicate") {
+      const source = buildSnapshot(hall(body.sourceId ?? body.id ?? "").id);
+      if (body.withoutEvents) source.events = [];
+      const suffix = " — копія";
+      const name = body.name ?? `${source.schedule.name.slice(0,80-suffix.length)}${suffix}`;
+      id = insertHall(name, source);
+    }
     else if (body.action === "delete") { removeHall(id ?? ""); id = undefined; }
     else { hall(id ?? ""); if (body.action === "rename") { if (!body.name) throw new AppError("Вкажіть назву залу.",422); sqlite().prepare("UPDATE halls SET name=?,updated_at=? WHERE id=?").run(body.name,Date.now(),id); sqlite().prepare("UPDATE schedules SET name=?,revision=revision+1,updated_at=? WHERE id=?").run(body.name,Date.now(),id); } }
     if (id) sqlite().prepare("INSERT INTO app_meta(key,value) VALUES('last_hall',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(id);
@@ -223,6 +229,11 @@ function convertLegacyHallPackage(raw:unknown):unknown {
   })};
 }
 
+function touchHall(hallId: string, now: number) {
+  sqlite().prepare("UPDATE schedules SET updated_at=? WHERE hall_id=?").run(now,hallId);
+  sqlite().prepare("UPDATE halls SET updated_at=? WHERE id=?").run(now,hallId);
+}
+
 export function mutateHallCatalog(hallId: string, entity: "trainers" | "class_types", raw: unknown) {
   hall(hallId);
   return sqlite().transaction(() => {
@@ -235,6 +246,7 @@ export function mutateHallCatalog(hallId: string, entity: "trainers" | "class_ty
       db.prepare("INSERT INTO trainers(id,hall_id,name,color,initials,notes,active,sort_order,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,color=excluded.color,initials=excluded.initials,notes=excluded.notes,active=excluded.active,sort_order=excluded.sort_order,updated_at=excluded.updated_at").run(t.id,hallId,t.name,t.color,t.initials??null,t.notes??null,+t.active,t.sortOrder,now,now);
       db.prepare("DELETE FROM trainer_class_types WHERE trainer_id=?").run(t.id);
       for (const id of new Set(p.classTypeIds)) db.prepare("INSERT INTO trainer_class_types(trainer_id,class_type_id) VALUES(?,?)").run(t.id,id);
+      touchHall(hallId,now);
       return t;
     }
     const t = classTypeSchema.parse(raw); owned(entity,t.id,hallId,true); for (const id of t.trainerIds) owned("trainers",id,hallId);
@@ -243,6 +255,7 @@ export function mutateHallCatalog(hallId: string, entity: "trainers" | "class_ty
     db.prepare("INSERT INTO class_types(id,hall_id,name,short_name,default_duration,color,description,active,sort_order,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,short_name=excluded.short_name,default_duration=excluded.default_duration,color=excluded.color,description=excluded.description,active=excluded.active,sort_order=excluded.sort_order,updated_at=excluded.updated_at").run(t.id,hallId,t.name,t.shortName,t.defaultDuration,t.color??null,t.description??null,+t.active,t.sortOrder,now,now);
     db.prepare("DELETE FROM trainer_class_types WHERE class_type_id=?").run(t.id);
     for (const id of new Set(t.trainerIds)) db.prepare("INSERT INTO trainer_class_types(trainer_id,class_type_id) VALUES(?,?)").run(id,t.id);
+    touchHall(hallId,now);
     return t;
   })();
 }
@@ -266,7 +279,10 @@ export function reorderHallCatalog(hallId: string, raw: unknown) {
   const table = p.entity === "trainers" ? "trainers" : "class_types";
   if (new Set(p.order).size !== p.order.length) throw new AppError("Повторювані ID.",422);
   for (const id of p.order) owned(table,id,hallId);
-  sqlite().transaction(() => { p.order.forEach((id,i) => sqlite().prepare(`UPDATE ${table} SET sort_order=? WHERE id=? AND hall_id=?`).run(i,id,hallId)); })();
+  sqlite().transaction(() => {
+    p.order.forEach((id,i) => sqlite().prepare(`UPDATE ${table} SET sort_order=? WHERE id=? AND hall_id=?`).run(i,id,hallId));
+    touchHall(hallId,Date.now());
+  })();
   return { ok: true };
 }
 

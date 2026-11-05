@@ -76,6 +76,29 @@ try {
   await page.keyboard.press("Escape");
   checks.cardSelectionAndEscape = true;
 
+  // A browser/OS can cancel a captured pointer (for example during touch scroll).
+  // The preview must roll back and subsequent pointer movement must stay inert.
+  for (const gesture of ["move", "resize"]) {
+    for (const cancellation of ["pointercancel", "lostpointercapture"]) {
+      const dragOrigin = await card.boundingBox();
+      const target = gesture === "resize" ? card.getByRole("separator") : card;
+      const targetBox = await target.boundingBox();
+      const dragX = targetBox.x + targetBox.width / 2;
+      const dragY = targetBox.y + targetBox.height / 2;
+      const property = gesture === "resize" ? "height" : "y";
+      await page.mouse.move(dragX, dragY);
+      await page.mouse.down();
+      await page.mouse.move(dragX, dragY + 50, { steps: 4 });
+      await until(async () => Math.abs((await card.boundingBox())[property] - dragOrigin[property]) > 5, `${gesture} preview movement`);
+      await target.dispatchEvent(cancellation, { pointerId: 1, pointerType: "mouse", bubbles: true });
+      await page.mouse.move(dragX, dragY + 90);
+      await page.mouse.up();
+      await until(async () => Math.abs((await card.boundingBox())[property] - dragOrigin[property]) < 1, `cancelled ${gesture} rollback`);
+      assert.equal(await page.getByRole("dialog").count(), 0);
+    }
+  }
+  checks.cancelledPointerRestoresDrag = true;
+
   const slot = page.locator(".cursor-copy").first();
   const box = await slot.boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height - 30);

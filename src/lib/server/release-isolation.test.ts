@@ -72,7 +72,13 @@ Write-Output $resolved
     const resolve = (override: string) => spawnSync("powershell.exe", ["-NoProfile", "-Command", script], { encoding: "utf8", env: { ...process.env, TEST_APP_ROOT: dir, LOCALAPPDATA: path.join(dir, "os-data"), RISEN_DB_PATH: override } });
     expect(resolve("").stdout.trim()).toBe(path.join(dir, "data/risen-team.db"));
     const explicit = path.join(dir, "explicit.db");
-    expect(resolve(explicit).stdout.trim()).toBe(explicit);
+    const overridden = resolve(explicit);
+    expect(overridden.status, overridden.stderr).toBe(0);
+    const resolvedExplicit = overridden.stdout.trim();
+    // Windows may expand an 8.3 TEMP alias (RUNNER~1) to its full folder name.
+    // The database need not exist yet, so compare its existing parent and leaf.
+    expect(fs.realpathSync.native(path.dirname(resolvedExplicit))).toBe(fs.realpathSync.native(dir));
+    expect(path.basename(resolvedExplicit)).toBe(path.basename(explicit));
     fs.rmSync(path.join(dir, "data/risen-team.db"));
     expect(resolve("").stdout.trim()).toBe(path.join(dir, "os-data/RisenTeamSchedule-v1.0/risen-team.db"));
   });

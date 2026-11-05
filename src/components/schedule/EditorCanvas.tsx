@@ -101,16 +101,23 @@ export function EditorCanvas(props: EditorCanvasProps) {
     [dayBounds],
   );
 
+  const cancelDrag = useCallback(() => {
+    const session = dragRef.current;
+    if (!session) return;
+    dragRef.current = null;
+    setDraggingEventId(null);
+    // A press below the move threshold never established a rollback state.
+    if (session.moved) onDragCancel();
+  }, [onDragCancel]);
+
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || !dragRef.current) return;
-      dragRef.current = null;
-      setDraggingEventId(null);
-      onDragCancel();
+      cancelDrag();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [onDragCancel]);
+  }, [cancelDrag]);
 
   const beginMove = (event: ScheduleEvent, nativeEvent: React.PointerEvent<HTMLElement>) => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -479,6 +486,8 @@ export function EditorCanvas(props: EditorCanvasProps) {
             }}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
+            onPointerCancel={cancelDrag}
+            onLostPointerCapture={cancelDrag}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
@@ -547,6 +556,8 @@ export function EditorCanvas(props: EditorCanvasProps) {
               onPointerDown={(event) => beginResize(card.event, event)}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
+              onPointerCancel={cancelDrag}
+              onLostPointerCapture={cancelDrag}
             />
           </div>
         );

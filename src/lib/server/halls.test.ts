@@ -1,10 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createProject } from "@/db/paths";
 import { closeDatabaseForTests, getDb } from "@/db";
-import { assertHallVersionContext, deleteHallCatalog, exportHalls, hallAction, importHalls, loadHallWorkspace, mutateHallCatalog, requireHallBackup, restoreHallVersion, saveHallState } from "@/lib/server/halls";
+import { assertHallVersionContext, deleteHallCatalog, exportHalls, hallAction, importHalls, loadHallWorkspace, mutateHallCatalog, reorderHallCatalog, requireHallBackup, restoreHallVersion, saveHallState } from "@/lib/server/halls";
 import { storeLogoDataUrl } from "@/lib/server/assets";
 
 let root:string;
@@ -17,6 +17,7 @@ beforeEach(() => {
   delete process.env.RISEN_DB_PATH;
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   closeDatabaseForTests();
   if (previous.workspace === undefined) delete process.env.RISEN_WORKSPACE_PATH; else process.env.RISEN_WORKSPACE_PATH=previous.workspace;
   if (previous.db === undefined) delete process.env.RISEN_DB_PATH; else process.env.RISEN_DB_PATH=previous.db;
@@ -31,6 +32,40 @@ function populated() {
   return id;
 }
 describe("hall isolation, revisions and exchange",() => {
+  it.each(["trainer", "classType", "trainerOrder", "classTypeOrder"] as const)("updates only the changed hall's date for %s", action => {
+    const id=populated();
+    mutateHallCatalog(id,"trainers",{trainer:{id:"trainer2",name:"Другий",color:"#334455",active:true,sortOrder:1},classTypeIds:[]});
+    mutateHallCatalog(id,"class_types",{id:"class2",name:"Другий тип",shortName:"Другий",defaultDuration:60,active:true,sortOrder:1,trainerIds:["trainer2"]});
+    const other=hallAction({action:"create",name:"Інший"}).activeScheduleId!;
+    const untouched=loadHallWorkspace(other).state.schedule;
+    const now=Date.UTC(2030,0,2,12);
+    vi.spyOn(Date,"now").mockReturnValue(now);
+    const before=loadHallWorkspace(id);
+    if(action==="trainer") mutateHallCatalog(id,"trainers",{trainer:{...before.trainers[0],name:"Нове ім’я"},classTypeIds:["class"]});
+    else if(action==="classType") mutateHallCatalog(id,"class_types",{...before.classTypes[0],name:"Новий тип"});
+    else {
+      const trainers=action==="trainerOrder";
+      const order=trainers?["trainer2","trainer"]:["class2","class"];
+      reorderHallCatalog(id,{entity:trainers?"trainers":"classTypes",order});
+      const after=loadHallWorkspace(id);
+      expect((trainers?after.trainers:after.classTypes).map(item=>item.id)).toEqual(order);
+    }
+    const after=loadHallWorkspace(id);
+    expect(after.state.schedule.updatedAt).toBe(new Date(now).toISOString());
+    expect(getDb().$client.prepare("SELECT updated_at FROM halls WHERE id=?").get(id)).toEqual({updated_at:now});
+    expect(loadHallWorkspace(other).state.schedule).toEqual(untouched);
+  });
+
+  it("keeps a duplicated maximum-length hall name portable through export and import", () => {
+    const source=hallAction({action:"create",name:"З".repeat(80)}).activeScheduleId!;
+    const copy=hallAction({action:"duplicate",sourceId:source}).activeScheduleId!;
+    const exported=exportHalls([copy]);
+    expect(exported.halls[0].name.length).toBeLessThanOrEqual(80);
+    expect(exported.halls[0].name).toMatch(/ — копія$/);
+    expect(()=>importHalls(exported)).not.toThrow();
+    expect(exportHalls().halls.filter(hall=>hall.name===exported.halls[0].name)).toHaveLength(2);
+  });
+
   it.each(["trainers", "class_types"] as const)("deletes %s and its current events atomically, preserving other halls and restorable history", entity => {
     const id=populated();
     const other=hallAction({action:"duplicate",sourceId:id,name:"Other"}).activeScheduleId!;
