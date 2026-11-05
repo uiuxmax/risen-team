@@ -1,5 +1,5 @@
 {
-  "sourceDigest": "837b4b22b93c06366cc0f00bcb75eac95e228991f57d69c412a3705b94d34def",
+  "sourceDigest": "edbc717b0cd8945d95c21d386fc0213d15c2f074f156c4141f78923ce99c6959",
   "tests": "passed",
   "audit": "passed",
   "codeReview": "passed",
@@ -28,7 +28,8 @@
     "Independent server audit: duplicate name export/import regression fixed; 23 hall integration tests passed.",
     "Independent editor audit and review: live autosave approval, localized duplicate names, pointer cancellation and below-threshold rollback reviewed.",
     "Independent native/release review: macOS Finder reopen handler, transactional timestamps and pinned Windows CI runner reviewed.",
-    "Independent CI follow-up review: canonical Windows parent plus filename preserves explicit database path identity; exit status is checked. Online audit corrects the invalid offline zero result; production 0, development 12 moderate, 0 high/critical."
+    "Independent CI follow-up review: canonical Windows parent plus filename preserves explicit database path identity; exit status is checked. Online audit corrects the invalid offline zero result; production 0, development 12 moderate, 0 high/critical.",
+    "Windows 8.3 behavior reproduced locally: realpathSync retains the short alias, realpathSync.native expands it. Native parent normalization is used in the release regression; all 410 local tests, typecheck and lint pass."
   ],
   "exportVisualReview": "passed: actual Chrome PNG/SVG and desktop/mobile screenshots",
   "manualBrowserReview": "Automated real Chrome acceptance passed; screenshots visually reviewed",
